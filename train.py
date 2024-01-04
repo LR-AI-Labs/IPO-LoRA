@@ -2,6 +2,7 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn as nn
 import transformers
+from transformers import BitsAndBytesConfig
 from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed, get_open_port
 import os
 import gc
@@ -14,7 +15,7 @@ import json
 import socket
 from typing import Optional, Set
 import resource
-from peft import LoraConfig, get_peft_model, PeftConfig, PeftModel
+from peft import LoraConfig, get_peft_model, PeftConfig, PeftModel, AutoPeftModelForCausalLM
 
 
 OmegaConf.register_new_resolver("get_local_run_dir", lambda exp_name, local_dirs: get_local_run_dir(exp_name, local_dirs))
@@ -83,6 +84,11 @@ def main(config: DictConfig):
     print('building policy')
     model_kwargs = {'device_map': 'balanced'} if config.trainer == 'BasicTrainer' else {}
     policy_dtype = getattr(torch, config.model.policy_dtype)
+    bnb_config = BitsAndBytesConfig( 
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
     peft_config = LoraConfig(
         r =32,
         lora_alpha = 16,
@@ -107,6 +113,9 @@ def main(config: DictConfig):
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), trust_remote_code=True ,low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
     lora_policy = get_peft_model(policy, peft_config)
+    del policy
+    gc.collect()
+    # torch.cuda.empty_cache()
     lora_policy.print_trainable_parameters()
     # lora_policy.config.pretraining_tp = 1
 
@@ -122,23 +131,39 @@ def main(config: DictConfig):
     #         lora_reference_model.load_state_dict(state_dict['state'])
     #     print('loaded pre-trained weights')
     if config.model.archive is not None:
-        del policy
         del lora_policy
         gc.collect()
         torch.cuda.empty_cache()
-        lora_config_poli = PeftConfig.from_pretrained(config.model.archive)
-        pretrained_policy = transformers.AutoModelForCausalLM.from_pretrained(
-            lora_config_poli.base_model_name_or_path, cache_dir=get_local_dir(config.local_dirs), trust_remote_code=True, low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
-        disable_dropout(pretrained_policy)
-        pretrained_lora_policy = PeftModel.from_pretrained(pretrained_policy, config.model.archive)
-        lora_policy = get_peft_model(pretrained_lora_policy, ipo_peft_config)
-        if config.loss.name in {'dpo', 'ipo'}:
-            lora_config_ref = PeftConfig.from_pretrained(config.model.archive)
-            pretrained_reference = transformers.AutoModelForCausalLM.from_pretrained(
-                lora_config_ref.base_model_name_or_path, cache_dir=get_local_dir(config.local_dirs), trust_remote_code=True, low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
-            pretrained_lora_reference = PeftModel.from_pretrained(pretrained_reference, config.model.archive)
-            lora_reference = get_peft_model(pretrained_lora_reference, ipo_peft_config)
-        print('loaded pre-trained weights')
+        output_dir = config.model.archive
+        model = AutoPeftModelForCausalLM.from_pretrained(output_dir, torch_dtype=policy_dtype, **model_kwargs)
+        model = model.merge_and_unload()
+
+        output_merged_dir = os.path.join(output_dir, "final_merged_checkpoint")
+        model.save_pretrained(output_merged_dir, safe_serialization=True)
+        print("Final merged checkpoint saved to %s", output_merged_dir)
+        policy = transformers.AutoModelForCausalLM.from_pretrained(
+            output_merged_dir, cache_dir=get_local_dir(config.local_dirs), trust_remote_code=True ,low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
+        disable_dropout(policy)
+        lora_policy = get_peft_model(policy, ipo_peft_config)
+        reference_dtype = getattr(torch, config.model.reference_dtype)
+        reference = transformers.AutoModelForCausalLM.from_pretrained(
+            output_merged_dir, cache_dir=get_local_dir(config.local_dirs), trust_remote_code=True ,low_cpu_mem_usage=True, torch_dtype=reference_dtype, **model_kwargs)
+        disable_dropout(reference)
+        lora_reference = get_peft_model(reference, ipo_peft_config)
+        # lora_config_poli = PeftConfig.from_pretrained(config.model.archive)
+        # pretrained_policy = transformers.AutoModelForCausalLM.from_pretrained(
+        #     lora_config_poli.base_model_name_or_path, cache_dir=get_local_dir(config.local_dirs), trust_remote_code=True, low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
+        # disable_dropout(pretrained_policy)
+        # pretrained_lora_policy = PeftModel.from_pretrained(pretrained_policy, config.model.archive)
+        # lora_policy = get_peft_model(pretrained_lora_policy, ipo_peft_config)
+        # if config.loss.name in {'dpo', 'ipo'}:
+        #     lora_config_ref = PeftConfig.from_pretrained(config.model.archive)
+        #     pretrained_reference = transformers.AutoModelForCausalLM.from_pretrained(
+        #         lora_config_ref.base_model_name_or_path, cache_dir=get_local_dir(config.local_dirs), trust_remote_code=True, low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
+        #     pretrained_lora_reference = PeftModel.from_pretrained(pretrained_reference, config.model.archive)
+        #     lora_reference = get_peft_model(pretrained_lora_reference, ipo_peft_config)
+        print('Succesfully loaded pre-trained weights from {}'.format(output_merged_dir))
+
     
     
     if 'FSDP' in config.trainer:
